@@ -1,11 +1,21 @@
 package Config;
 
+use Moo;
 use Config::Tiny;
+
+has ini_file => (
+    is => 'ro',
+    default => sub {
+        Config::Tiny->read('config/config.ini');
+    }
+);
 
 sub get_dsn_data
 {
+    my $self = shift;
+
     my ($username, $password, $host, $port, $driver, $dbname);
-    my $config = Config::Tiny->read('config/config.ini');
+    my $config = $self->ini_file;
 
     if ($config->{db}){
         ($username, $password, $host, $port, $driver, $dbname) = @{$config->{db}}{qw(username password host port driver dbname)};
@@ -23,6 +33,19 @@ sub get_dsn_data
 	$dsn .= sprintf(';port=%s', $port) if $port;
 
     return ($dsn, $username, $password);
+}
+
+sub get_api_link
+{
+    my $self = shift;
+
+    my $config = $self->ini_file;
+    my $link = '';
+    if ($config->{similarweb}){
+        $link = sprintf $config->{similarweb}->{link}, $config->{similarweb}->{apikey};
+    }
+
+    return $link;
 }
 
 1;

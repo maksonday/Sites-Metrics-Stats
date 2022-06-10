@@ -1,122 +1,127 @@
 package Fetcher;
 
+use Moo;
 use Mojo::Promise;
-use Data::Dumper;
-use Try::Tiny;
 use List::Util qw (uniq);
+use Mojo::UserAgent;
+use Cwd qw( abs_path );
 
-my @sites_list = (
-    'yandex.ru',
-    'youtube.com',
-    'google.com',
-    'vk.com',
-    'turbopages.org',
-    'mail.ru',
-    'ok.ru',
-    'avito.ru',
-    'wildberries.ru',
-    'gismeteo.ru',
-    'wikipedia.org',
-    'ozon.ru',
-    'market.yandex.ru',
-    'google.ru',
-    'ria.ru',
-    'lenta.ru',
-    'kinopoisk.ru',
-    'news.mail.ru',
-    'gosuslugi.ru',
-    'rbc.ru',
-    'rambler.ru',
-    'whatsapp.com',
-    'cloud.mail.ru',
-    't.me',
-    'aliexpress.ru',
-    'xvideos.com',
-    'music.yandex.ru',
-    'drom.ru',
-    'rus-tv.su',
-    'dns-shop.ru',
-    'sberbank.ru',
-    'pikabu.ru',
-    'ficbook.net',
-    'livejournal.com',
-    'mk.ru',
-    'tsargrad.tv',
-    'twitch.tv',
-    'hh.ru',
-    'vz.ru',
-    'kp.ru',
-    'drive2.ru',
-    'roblox.com',
-    'gazeta.ru',
-    'rt.com',
-    'mos.ru',
-    '2gis.ru',
-    'rutube.ru',
-    'telegram.org',
-    'fandom.com',
-    'instagram.com'
+use Module::Find;
+useall 'db';
+useall 'config';
+
+use Log::Log4perl;
+
+has logger => (
+    is => 'ro',
+    default => sub {
+        Log::Log4perl::init(abs_path().'/log.conf');
+        Log::Log4perl->get_logger();
+    }
 );
 
-sub run
-{
-    my $ua = Mojo::UserAgent->new;
-    $ua = $ua->connect_timeout(1);
-    my @promises;
-    for (@sites_list){
-        push @promises, $ua->head_p($_)->timeout(1);
+has ua => (
+    is => 'ro',
+    default => sub {
+        Mojo::UserAgent->new;
     }
-    my @ref_promises;
-    my $start_time = Time::HiRes::gettimeofday();
-    my $cnt = 0;
-    my $ref_cnt = 0;
-    Mojo::Promise->all_settled(@promises)->then(sub(@promises){
+);
+
+sub log
+{
+    my ($self, $message) = @_;
+    $self->logger->error($message);
+}
+
+sub fetch
+{
+    my ($self, $sites_list) = @_;
+    
+    my (@promises, @ref_promises, @ref_promises_indexes);
+    my %sites_info;
+    my @sites_info;
+
+    for (@$sites_list){
+        push(@promises, $self->ua->get_p($_));
+    }
+
+    my $analytics_pattern = '(google-analytics\.com|mc\.yandex\.ru)';
+
+    Mojo::Promise->all_settled(@promises)->then(sub {
+        my @promises = @_;
+        my $cnt = 0;
+
         for my $tx(@promises){
-            try{
-                if ($tx->{status} eq 'fulfilled'){
-                    my $res = $tx->{value}->[0]->res;
-                    my $location = $res->headers->location;
-                    $ref_cnt++ if $location;
-                    warn $res->code unless $location;
-                    $cnt++;
-                    push @ref_promises, $ua->get_p($location)->timeout(1);
-                }
-                else{
-                    warn $tx->{reason}->[0];
+            if ($tx->{status} eq 'fulfilled'){
+                my $res = $tx->{value}->[0]->res;
+                my $location = $res->headers->location || '';
+
+                my @arr = uniq ( ($res->body) =~ m/$analytics_pattern/g );
+                push(@sites_info, @arr ? \@arr : []);
+
+                if ($location){
+                    push(@ref_promises, $self->ua->get_p($location));
+                    push(@ref_promises_indexes, @sites_info - 1);
                 }
             }
-            catch{
-                warn $_;
+            else{
+                push(@sites_info, $tx->{reason}->[0]);
             }
-        }
-        
-    })->catch(sub{
+            $cnt++;
+        } 
+    })->catch(sub {
         my $err = shift;
-        warn $err;
+        $self->log($err);
     })->wait;
 
-    my %sites;
-
-    my $i = 0;
-    Mojo::Promise->all_settled(@ref_promises)->then(sub(@promises){
+    
+    Mojo::Promise->all_settled(@ref_promises)->then(sub {
+        my @promises = @_;
+        my $cnt = 0;
+ 
         for my $tx(@promises){
-            try{
-                if ($tx->{status} eq 'fulfilled'){
-                    my $res = $tx->{value}->[0]->res;
-                    my @arr = uniq ( ($res->body) =~ m/google\-analytics|mc\.yandex\.ru/g );
-                    $i++;
-                    $sites{$sites_list[$i++]} = \@arr;
-                }
+            if ($tx->{status} eq 'fulfilled'){
+                my $res = $tx->{value}->[0]->res;
+                my @arr = uniq ( ($res->body) =~ m/$analytics_pattern/g );
+                $sites_info[$ref_promises_indexes[$cnt]] = @arr ? \@arr : [];
             }
-            catch{
-                warn $_;
+            else{
+                $sites_info[$ref_promises_indexes[$cnt]] = $tx->{reason}->[0];
             }
+            $cnt++;
         }
         
-    })->catch(sub{
+    })->catch(sub {
         my $err = shift;
-        warn $err;
+        $self->log($err);
     })->wait;
+
+    for (0..@$sites_list - 1){
+        $sites_info{$sites_list->[$_]} = $sites_info[$_];
+    }
+
+    return \%sites_info;
+}
+
+sub get_top_sites
+{
+    my ($self, $link) = @_;
+    my @sites;
+
+    my $res = $self->ua->get_p($link => {Accept => 'application/json'})->then(sub {
+        my $tx = shift;
+        my $res = $tx->result;
+        if ($res->is_success){ 
+            for (@{$res->json->{top_sites}}){
+                push(@sites, $_->{domain});
+            }
+        }
+    })->catch(sub {
+        my $err = shift;
+        $self->log("Connection error: $err");
+    })->wait;
+    
+    return \@sites;
 }
 
 1;
